@@ -63,6 +63,7 @@ DEFAULT_SETTINGS = {
     "window": [0, 0, 560, 800],
     "last_book": "",            # 上次读的书，下次启动自动接着打开
     "auto_hide_ui": True,       # 鼠标移开自动隐藏上下工具栏（默认开）
+    "auto_next": True,          # 读到章末自动进入下一章
 }
 
 TEXT_COLORS = [
@@ -315,12 +316,19 @@ class Bar(QWidget):
 
 # ----------------------------------------------------------------------------- 面板基类
 class Panel(QWidget):
-    """带圆角半透明底的浮层面板"""
+    """带圆角半透明底的浮层面板；floating=True 时是独立置顶浮窗，不受主窗口大小限制"""
 
-    def __init__(self, parent=None, bg=(26, 26, 32, 242), radius=12):
-        super().__init__(parent)
+    def __init__(self, parent=None, bg=(26, 26, 32, 242), radius=12, floating=False):
+        if floating:
+            super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+            self.setAttribute(Qt.WA_TranslucentBackground, True)
+            self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        else:
+            super().__init__(parent)
         self._bg = QColor(*bg)
         self._radius = radius
+        self._drag_origin = None
+        self._user_placed = False      # 手动拖过就不再自动贴回主窗口
 
     def set_bg(self, color):
         self._bg = QColor(color)
@@ -329,9 +337,46 @@ class Panel(QWidget):
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        if self.isWindow():
+            # 独立浮窗：先把表面清成全透明，否则圆角外面会残留底色
+            p.setCompositionMode(QPainter.CompositionMode_Source)
+            p.fillRect(self.rect(), Qt.transparent)
+            p.setCompositionMode(QPainter.CompositionMode_SourceOver)
         p.setPen(Qt.NoPen)
         p.setBrush(self._bg)
         p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), self._radius, self._radius)
+
+    # 浮窗可以按住空白处拖动，拖到顺手的位置
+    def mousePressEvent(self, e):
+        if self.isWindow() and e.button() == Qt.LeftButton:
+            self._drag_origin = e.globalPos() - self.frameGeometry().topLeft()
+            self._drag_start_pos = self.pos()
+            self._moved_by_user = False
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self.isWindow() and self._drag_origin is not None and (e.buttons() & Qt.LeftButton):
+            self.move(e.globalPos() - self._drag_origin)
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self.isWindow() and self._drag_origin is not None:
+            self._drag_origin = None
+            # 只有真的拖动过才算「用户自己摆的位置」；单纯点一下按钮 / 点空白不算
+            if self.pos() != getattr(self, "_drag_start_pos", self.pos()):
+                self._user_placed = True
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def hideEvent(self, e):
+        # 每次重新打开都回到主窗口旁边，避免下次在主窗口移走后才在旧位置弹出来
+        self._user_placed = False
+        super().hideEvent(e)
 
 
 def slider_row(label, minv, maxv, value, fmt, on_change, suffix=""):
@@ -530,8 +575,7 @@ class ReaderWindow(QWidget):
         self.grip.setStyleSheet("background:transparent;")
 
         # 目录 / 书架面板
-        self.toc_panel = Panel(self)
-        self.toc_panel.setMinimumWidth(130)
+        self.toc_panel = Panel(floating=True)
         tl = QVBoxLayout(self.toc_panel)
         tl.setContentsMargins(12, 12, 12, 12)
         tl.setSpacing(8)
@@ -587,8 +631,7 @@ class ReaderWindow(QWidget):
         tl.addWidget(self.toc_stack, 1)
 
         # 设置面板
-        self.set_panel = Panel(self)
-        self.set_panel.setMinimumWidth(130)
+        self.set_panel = Panel(floating=True)
         # 设置内容放进滚动区：窗口缩到很小时面板也塞得下，滚一滚就能改任何一项，
         # 不再靠「把窗口撑大」这种强扭的做法
         self.set_content = QWidget()
@@ -713,10 +756,15 @@ class ReaderWindow(QWidget):
         self.cb_auto.setToolTip("勾选后：鼠标离开窗口，上下工具栏淡出消失；鼠标移回窗口，工具栏淡入出现。"
                                 "正文位置不会因为工具栏显隐而跳动")
         self.cb_auto.toggled.connect(self._on_auto_hide_switch)
+        self.cb_autonext = QCheckBox("读到章末自动进入下一章")
+        self.cb_autonext.setToolTip("滚到本章最后一行、停住约 1.6 秒，自动翻到下一章并回到顶部；"
+                                    "中途往上滚一下就取消")
+        self.cb_autonext.toggled.connect(self._on_auto_next)
         sl.addWidget(self.cb_indent)
         sl.addWidget(self.cb_shadow)
         sl.addWidget(self.cb_ui)
         sl.addWidget(self.cb_auto)
+        sl.addWidget(self.cb_autonext)
 
         # 自动滚动速度
         self.row_speed, self.sl_speed = slider_row(
@@ -892,6 +940,10 @@ class ReaderWindow(QWidget):
         self.cb_auto.blockSignals(True)
         self.cb_auto.setChecked(bool(s["auto_hide_ui"]))
         self.cb_auto.blockSignals(False)
+
+        self.cb_autonext.blockSignals(True)
+        self.cb_autonext.setChecked(bool(s.get("auto_next", True)))
+        self.cb_autonext.blockSignals(False)
         self._auto_timer.start()          # 常驻计时（迷你条显隐也用它）
 
         for b, c in self.color_btns:
@@ -1018,32 +1070,41 @@ class ReaderWindow(QWidget):
         else:
             self.set_panel.hide()
             self._refresh_chapters()
+            self._layout_panels()
             self.toc_panel.show()
             self.toc_panel.raise_()
-            self._layout_panels()
             if getattr(self, "_compact", False):
-                self.mini.hide()        # 小窗里面板几乎铺满，别让迷你条压住面板标题
+                self.mini.hide()
 
     def toggle_settings(self):
         if self.set_panel.isVisible():
             self.set_panel.hide()
         else:
             self.toc_panel.hide()
+            self._layout_panels()
             self.set_panel.show()
             self.set_panel.raise_()
-            self._layout_panels()
             if getattr(self, "_compact", False):
                 self.mini.hide()
 
     def _layout_panels(self):
+        """目录 / 设置是独立浮窗：贴在主窗口右侧（右边放不下就放左侧），
+        高度按屏幕算，不跟着主窗口缩水——窗口缩成一条也能把设置完整展开。"""
         if not hasattr(self, "toc_panel"):
             return
-        pad = 8
-        pw = max(130, min(300, self.width() - pad * 2))
-        sw = max(130, min(320, self.width() - pad * 2))
-        ph = max(60, self.height() - pad * 2)
-        self.toc_panel.setGeometry(self.width() - pw - pad, pad, pw, ph)
-        self.set_panel.setGeometry(self.width() - sw - pad, pad, sw, ph)
+        screen = QApplication.primaryScreen().availableGeometry()
+        for panel, pw in ((self.toc_panel, 320), (self.set_panel, 340)):
+            ph = min(640, screen.height() - 32)
+            pw = min(pw, screen.width() - 16)
+            x = self.x() + self.width() + 10
+            if x + pw > screen.left() + screen.width() - 4:
+                x = self.x() - pw - 10
+            if x < screen.left() + 4:
+                x = max(screen.left() + 4,
+                        min(screen.left() + screen.width() - pw - 4, self.x()))
+            y = max(screen.top() + 4,
+                    min(self.y(), screen.top() + screen.height() - ph - 4))
+            panel.setGeometry(x, y, pw, ph)
 
     # ---------------- 窗口拖动 / 缩放
     def _edge_at(self, pos):
@@ -1120,13 +1181,31 @@ class ReaderWindow(QWidget):
 
     def resizeEvent(self, e):
         if hasattr(self, "toc_panel"):
-            self._layout_panels()
+            self._follow_panels()
             self.mini.move((self.width() - self.mini.sizeHint().width()) // 2, 6)
             self.grip.move(self.width() - 26, self.height() - 26)
             if hasattr(self, "drop_hint"):
                 self.drop_hint.setGeometry(0, 0, self.width(), self.height())
         super().resizeEvent(e)
         self._update_compact()
+
+    def moveEvent(self, e):
+        if hasattr(self, "toc_panel"):
+            self._follow_panels()
+        super().moveEvent(e)
+
+    def _follow_panels(self):
+        """主窗口移动/缩放时让浮窗跟着走；被人手动拖过的面板就尊重它自己的位置"""
+        for panel in (self.toc_panel, self.set_panel):
+            if panel.isVisible() and not getattr(panel, "_user_placed", False):
+                self._layout_panels()
+                return
+
+    def hideEvent(self, e):
+        if hasattr(self, "toc_panel"):
+            self.toc_panel.hide()
+            self.set_panel.hide()
+        super().hideEvent(e)
 
     # ---------------- 最小尺寸 / 矮窗模式
     def _update_min_size(self):
@@ -1411,7 +1490,10 @@ class ReaderWindow(QWidget):
 
     def _restore_scroll(self, value):
         sb = self.view.verticalScrollBar()
+        # 程序自己恢复位置（比如翻上一章时停在章末）不要触发自动续章，否则会来回跳
+        self._no_auto_next = True
         sb.setValue(min(value, sb.maximum()))
+        QTimer.singleShot(2500, lambda: setattr(self, "_no_auto_next", False))
 
     def _on_scroll(self, v):
         if not hasattr(self, "_save_timer"):
@@ -1419,6 +1501,44 @@ class ReaderWindow(QWidget):
             self._save_timer.setSingleShot(True)
             self._save_timer.timeout.connect(self._save_progress)
         self._save_timer.start(1200)
+        self._check_chapter_end(v)
+
+    # ---------------- 读到章末自动进下一章
+    def _check_chapter_end(self, v=None):
+        """滚到底并且停住不动时，自动翻到下一章（往上滚回去就取消）"""
+        sb = self.view.verticalScrollBar()
+        if not self.settings.get("auto_next", True) or not self.book:
+            return
+        if getattr(self, "_no_auto_next", False):
+            return
+        if not hasattr(self, "_auto_next_timer"):
+            self._auto_next_timer = QTimer(self)
+            self._auto_next_timer.setSingleShot(True)
+            self._auto_next_timer.timeout.connect(self._do_auto_next)
+        if sb.maximum() <= 0 or self.idx >= len(self.book.chapters) - 1:
+            self._auto_next_timer.stop()
+            return
+        if sb.value() >= sb.maximum() - 1:
+            self._auto_next_timer.start(1600)
+        else:
+            self._auto_next_timer.stop()
+
+    def _do_auto_next(self):
+        sb = self.view.verticalScrollBar()
+        if not self.settings.get("auto_next", True) or not self.book:
+            return
+        if self.idx >= len(self.book.chapters) - 1:
+            return
+        if sb.value() < sb.maximum() - 1:
+            return
+        self._load_chapter(self.idx + 1)
+        QTimer.singleShot(80, lambda: self.view.verticalScrollBar().setValue(0))
+
+    def _on_auto_next(self, on):
+        self.settings["auto_next"] = bool(on)
+        if not on and hasattr(self, "_auto_next_timer"):
+            self._auto_next_timer.stop()
+        self._save_settings()
 
     def _save_progress(self):
         if not self.book:
@@ -1715,6 +1835,9 @@ class ReaderWindow(QWidget):
         a6b = menu.addAction("鼠标移开自动隐藏工具栏")
         a6b.setCheckable(True)
         a6b.setChecked(bool(self.settings.get("auto_hide_ui")))
+        a6c = menu.addAction("读到章末自动进入下一章")
+        a6c.setCheckable(True)
+        a6c.setChecked(bool(self.settings.get("auto_next", True)))
         a7 = menu.addAction("导入其他小说")
         menu.addSeparator()
         a8 = menu.addAction("退出")
@@ -1737,6 +1860,12 @@ class ReaderWindow(QWidget):
             self.cb_auto.setChecked(on)
             self.cb_auto.blockSignals(False)
             self._on_auto_hide_switch(on)
+        elif act == a6c:
+            on = not bool(self.settings.get("auto_next", True))
+            self.cb_autonext.blockSignals(True)
+            self.cb_autonext.setChecked(on)
+            self.cb_autonext.blockSignals(False)
+            self._on_auto_next(on)
         elif act == a7:
             self.import_files()
         elif act == a8:
@@ -1840,6 +1969,11 @@ class ReaderWindow(QWidget):
 
     def closeEvent(self, e):
         self._save_all()
+        for panel in (getattr(self, "toc_panel", None), getattr(self, "set_panel", None)):
+            try:
+                panel.close()
+            except Exception:
+                pass
         try:
             ctypes.windll.user32.UnregisterHotKey(int(self.winId()), self.hotkey_id)
         except Exception:
